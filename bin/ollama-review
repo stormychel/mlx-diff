@@ -1,0 +1,89 @@
+#!/usr/bin/env bash
+#
+#  ollama-review
+#  OllamaReviewer
+#
+#  Created by Michel Storms on 08/06/2026.
+#
+#  Reviews a git diff with a local Ollama model (default: qwen3-coder).
+#  Designed to slot into the Codex -> agy -> Claude review fallback chain
+#  as a fully-offline, quota-free rung.
+
+set -euo pipefail
+
+MODEL="${OLLAMA_REVIEW_MODEL:-qwen3-coder:latest}"
+BASE=""
+PR=""
+COMMENT=0
+
+PROMPT='You are a senior code reviewer. Review ONLY the following git diff. Focus on real correctness bugs, lifecycle/concurrency pitfalls, retain cycles, and regressions. Be concise. For each finding give: severity (P1/P2/P3), file:area, and the issue. If nothing substantive, say so. Do not restate the diff.'
+
+usage() {
+  cat <<'EOF'
+Usage: ollama-review [options]
+
+Options:
+  --base <branch>   Base branch to diff against (default: auto-detect main/master)
+  --model <name>    Ollama model to use (default: $OLLAMA_REVIEW_MODEL or qwen3-coder:latest)
+  --pr <number>     Review a GitHub PR diff instead of the local branch
+  --comment         Post the review as a comment on the PR (requires --pr)
+  -h, --help        Show this help
+
+Examples:
+  ollama-review --base main
+  ollama-review --model deepseek-coder-v2:latest
+  ollama-review --pr 42 --comment
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)    BASE="$2"; shift 2 ;;
+    --model)   MODEL="$2"; shift 2 ;;
+    --pr)      PR="$2"; shift 2 ;;
+    --comment) COMMENT=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+  esac
+done
+
+command -v ollama >/dev/null 2>&1 || { echo "error: ollama not found on PATH" >&2; exit 1; }
+
+# Confirm the model is pulled locally.
+if ! ollama list 2>/dev/null | awk '{print $1}' | grep -qx "$MODEL"; then
+  echo "error: model '$MODEL' not pulled. Run: ollama pull $MODEL" >&2
+  exit 1
+fi
+
+# Gather the diff.
+if [[ -n "$PR" ]]; then
+  command -v gh >/dev/null 2>&1 || { echo "error: gh not found on PATH" >&2; exit 1; }
+  DIFF="$(gh pr diff "$PR")"
+else
+  command -v git >/dev/null 2>&1 || { echo "error: git not found on PATH" >&2; exit 1; }
+  if [[ -z "$BASE" ]]; then
+    if git show-ref --verify --quiet refs/heads/main; then BASE="main"
+    elif git show-ref --verify --quiet refs/heads/master; then BASE="master"
+    else echo "error: could not auto-detect base branch; pass --base" >&2; exit 1; fi
+  fi
+  DIFF="$(git diff "${BASE}...HEAD")"
+fi
+
+if [[ -z "${DIFF// }" ]]; then
+  echo "No diff to review." >&2
+  exit 0
+fi
+
+# Run the review. Strip ANSI/spinner noise from interactive ollama output.
+REVIEW="$(printf '%s\n\n```diff\n%s\n```\n' "$PROMPT" "$DIFF" \
+  | ollama run "$MODEL" 2>/dev/null \
+  | sed -E 's/\x1b\[[0-9;?]*[a-zA-Z]//g' | sed -E 's/\x1b[<>=]//g')"
+
+HEADER="## Ollama review (\`$MODEL\`)"
+
+if [[ "$COMMENT" -eq 1 && -n "$PR" ]]; then
+  printf '%s\n\n%s\n' "$HEADER" "$REVIEW" | gh pr comment "$PR" --body-file -
+  echo "Posted review to PR #$PR" >&2
+else
+  printf '%s\n\n%s\n' "$HEADER" "$REVIEW"
+fi
