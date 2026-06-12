@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+#
+#  localreview
+#  localreview
+#
+#  Created by Michel Storms on 12/06/2026.
+#
+#  Reviews a git diff (or a GitHub PR) with a local MLX model on Apple Silicon.
+#  Default model: mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit.
+#  Fully offline and quota-free. Every run is logged to runs.jsonl for tracing.
+
+set -euo pipefail
+
+VERSION="0.2.0"
+
+MODEL="${LOCALREVIEW_MODEL:-mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit}"
+MAX_TOKENS="${LOCALREVIEW_MAX_TOKENS:-2000}"
+TEMP="${LOCALREVIEW_TEMP:-0.2}"
+
+BASE=""
+PR=""
+COMMENT=0
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/localreview"
+LOG_FILE="${LOCALREVIEW_LOG:-$STATE_DIR/runs.jsonl}"
+
+SYS='You are a senior code reviewer. Review ONLY the provided git diff. Focus on real correctness bugs, lifecycle/concurrency pitfalls, retain cycles, resource leaks, and regressions. Be concise. For each finding output one line in the form: <P1|P2|P3>  <file:area>  <one-line description>. P1=ship-blocker, P2=should-fix, P3=minor. If nothing substantive is wrong, output exactly: No substantive findings. Do not restate the diff or explain what the code does.'
+
+usage() {
+  cat <<EOF
+localreview $VERSION — review a git diff or GitHub PR with a local MLX model.
+
+Usage: localreview [options]
+
+Options:
+  --base <branch>   Base branch to diff against (default: auto-detect main/master)
+  --pr <number>     Review a GitHub PR diff instead of the local branch
+  --comment         Post the review as a comment on the PR (requires --pr)
+  --model <name>    MLX model repo (default: \$LOCALREVIEW_MODEL or the bundled Qwen3-Coder)
+  --version         Print version and exit
+  -h, --help        Show this help
+
+Environment:
+  LOCALREVIEW_MODEL       Default model repo
+  LOCALREVIEW_MAX_TOKENS  Max generated tokens (default: 2000)
+  LOCALREVIEW_TEMP        Sampling temperature (default: 0.2)
+  LOCALREVIEW_LOG         Path to the run log (default: \$XDG_STATE_HOME/localreview/runs.jsonl)
+
+Examples:
+  localreview --base main
+  localreview --model mlx-community/Qwen2.5-Coder-32B-Instruct-8bit
+  localreview --pr 42 --comment
+EOF
+}
+
+# --- arg parsing (handled before any host preflight so --help/--version work anywhere) ---
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)    BASE="${2:-}"; shift 2 ;;
+    --pr)      PR="${2:-}"; shift 2 ;;
+    --comment) COMMENT=1; shift ;;
+    --model)   MODEL="${2:-}"; shift 2 ;;
+    --version) echo "localreview $VERSION"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "error: unknown option: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+
+if [[ "$COMMENT" -eq 1 && -z "$PR" ]]; then
+  echo "error: --comment requires --pr <number>" >&2
+  exit 1
+fi
+
+# --- host preflight: MLX is Apple-Silicon-only ---
+if [[ "$(uname -s)/$(uname -m)" != "Darwin/arm64" ]]; then
+  echo "error: localreview requires Apple Silicon macOS — MLX is not supported on $(uname -s)/$(uname -m)." >&2
+  echo "       Run it on a Mac or a macOS-on-Apple-Silicon VM." >&2
+  exit 1
+fi
+
+command -v mlx_lm.generate >/dev/null 2>&1 || {
+  echo "error: mlx_lm not found on PATH. Install it with: pipx install mlx-lm  (or run ./install.sh)" >&2
+  exit 1
+}
+
+# --- gather the diff ---
+if [[ -n "$PR" ]]; then
+  command -v gh >/dev/null 2>&1 || { echo "error: gh not found on PATH (needed for --pr)" >&2; exit 1; }
+  SOURCE="pr#$PR"
+  DIFF="$(gh pr diff "$PR")"
+else
+  command -v git >/dev/null 2>&1 || { echo "error: git not found on PATH" >&2; exit 1; }
+  if [[ -z "$BASE" ]]; then
+    if   git show-ref --verify --quiet refs/heads/main;   then BASE="main"
+    elif git show-ref --verify --quiet refs/heads/master; then BASE="master"
+    else echo "error: could not auto-detect base branch; pass --base <branch>" >&2; exit 1; fi
+  fi
+  SOURCE="$BASE...HEAD"
+  DIFF="$(git diff "${BASE}...HEAD")"
+fi
+
+if [[ -z "${DIFF//[$' \t\r\n']/}" ]]; then
+  echo "No diff to review." >&2
+  exit 0
+fi
+
+# Unlike Ollama's fixed default context, MLX uses the model's full context window,
+# but very large diffs are slow and memory-hungry — warn past a soft threshold.
+DIFF_BYTES=${#DIFF}
+if [[ "$DIFF_BYTES" -gt 200000 ]]; then
+  echo "warning: diff is ${DIFF_BYTES} bytes — review may be slow or exceed the model context." >&2
+fi
+
+# --- run the review ---
+REVIEW="$(printf '%s\n' "$DIFF" | mlx_lm.generate \
+  --model "$MODEL" \
+  --system-prompt "$SYS" \
+  --prompt - \
+  --max-tokens "$MAX_TOKENS" \
+  --temp "$TEMP" \
+  --verbose False 2>/dev/null)"
+
+MODEL_SHORT="${MODEL##*/}"
+HEADER="## MLX review (\`$MODEL_SHORT\`)"
+
+# --- trace: append a structured record of this run ---
+json_escape() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
+mkdir -p "$(dirname "$LOG_FILE")"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo '')"
+printf '{"ts":"%s","engine":"mlx","model":"%s","source":"%s","repo":"%s","review_chars":%d,"posted":%s}\n' \
+  "$TS" "$(json_escape "$MODEL")" "$(json_escape "$SOURCE")" "$(json_escape "$REPO_ROOT")" \
+  "${#REVIEW}" "$([[ "$COMMENT" -eq 1 ]] && echo true || echo false)" >> "$LOG_FILE"
+
+# --- emit or post ---
+if [[ "$COMMENT" -eq 1 && -n "$PR" ]]; then
+  printf '%s\n\n%s\n' "$HEADER" "$REVIEW" | gh pr comment "$PR" --body-file -
+  echo "Posted review to PR #$PR" >&2
+else
+  printf '%s\n\n%s\n' "$HEADER" "$REVIEW"
+fi
