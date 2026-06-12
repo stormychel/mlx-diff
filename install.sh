@@ -159,10 +159,15 @@ say "Selected: $CHOSEN"
 mkdir -p "$CONFIG_DIR"
 printf '%s\n' "$CHOSEN" > "$CONFIG_DIR/model"
 
-# 5. Pre-pull the chosen model (so the first review isn't a cold download).
+# 5. Pre-pull the chosen model — but only if it isn't already cached. (Loading a
+#    30 GB model just to warm it up is pointless when it's already downloaded.)
 #    stderr stays attached so HuggingFace's download bars are visible; only the
 #    throwaway generation on stdout is discarded.
-if [[ "${MLXDIFF_SKIP_PULL:-0}" != "1" ]]; then
+if model_cached "$CHOSEN"; then
+  say "$CHOSEN is already installed — nothing to download."
+elif [[ "${MLXDIFF_SKIP_PULL:-0}" == "1" ]]; then
+  say "Skipping model download (MLXDIFF_SKIP_PULL=1) — it will download on first review."
+else
   say "Pre-pulling $CHOSEN (set MLXDIFF_SKIP_PULL=1 to skip)…"
   if mlx_lm.generate --model "$CHOSEN" --prompt "ok" --max-tokens 1 --verbose False >/dev/null; then
     say "Model ready."
