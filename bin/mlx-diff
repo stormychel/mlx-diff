@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-#  localreview
-#  localreview
+#  mlx-diff
+#  mlx-diff
 #
 #  Created by Michel Storms on 12/06/2026.
 #
@@ -13,43 +13,43 @@ set -euo pipefail
 
 VERSION="0.2.0"
 
-MODEL="${LOCALREVIEW_MODEL:-mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit}"
-MAX_TOKENS="${LOCALREVIEW_MAX_TOKENS:-2000}"
-TEMP="${LOCALREVIEW_TEMP:-0.2}"
+MODEL="${MLXDIFF_MODEL:-mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit}"
+MAX_TOKENS="${MLXDIFF_MAX_TOKENS:-2000}"
+TEMP="${MLXDIFF_TEMP:-0.2}"
 
 BASE=""
 PR=""
 COMMENT=0
 
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/localreview"
-LOG_FILE="${LOCALREVIEW_LOG:-$STATE_DIR/runs.jsonl}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mlx-diff"
+LOG_FILE="${MLXDIFF_LOG:-$STATE_DIR/runs.jsonl}"
 
 SYS='You are a senior code reviewer. Review ONLY the provided git diff. Focus on real correctness bugs, lifecycle/concurrency pitfalls, retain cycles, resource leaks, and regressions. Be concise. For each finding output one line in the form: <P1|P2|P3>  <file:area>  <one-line description>. P1=ship-blocker, P2=should-fix, P3=minor. If nothing substantive is wrong, output exactly: No substantive findings. Do not restate the diff or explain what the code does.'
 
 usage() {
   cat <<EOF
-localreview $VERSION — review a git diff or GitHub PR with a local MLX model.
+mlx-diff $VERSION — review a git diff or GitHub PR with a local MLX model.
 
-Usage: localreview [options]
+Usage: mlx-diff [options]
 
 Options:
   --base <branch>   Base branch to diff against (default: auto-detect main/master)
   --pr <number>     Review a GitHub PR diff instead of the local branch
   --comment         Post the review as a comment on the PR (requires --pr)
-  --model <name>    MLX model repo (default: \$LOCALREVIEW_MODEL or the bundled Qwen3-Coder)
+  --model <name>    MLX model repo (default: \$MLXDIFF_MODEL or the bundled Qwen3-Coder)
   --version         Print version and exit
   -h, --help        Show this help
 
 Environment:
-  LOCALREVIEW_MODEL       Default model repo
-  LOCALREVIEW_MAX_TOKENS  Max generated tokens (default: 2000)
-  LOCALREVIEW_TEMP        Sampling temperature (default: 0.2)
-  LOCALREVIEW_LOG         Path to the run log (default: \$XDG_STATE_HOME/localreview/runs.jsonl)
+  MLXDIFF_MODEL       Default model repo
+  MLXDIFF_MAX_TOKENS  Max generated tokens (default: 2000)
+  MLXDIFF_TEMP        Sampling temperature (default: 0.2)
+  MLXDIFF_LOG         Path to the run log (default: \$XDG_STATE_HOME/mlx-diff/runs.jsonl)
 
 Examples:
-  localreview --base main
-  localreview --model mlx-community/Qwen2.5-Coder-32B-Instruct-8bit
-  localreview --pr 42 --comment
+  mlx-diff --base main
+  mlx-diff --model mlx-community/Qwen2.5-Coder-32B-Instruct-8bit
+  mlx-diff --pr 42 --comment
 EOF
 }
 
@@ -60,7 +60,7 @@ while [[ $# -gt 0 ]]; do
     --pr)      PR="${2:-}"; shift 2 ;;
     --comment) COMMENT=1; shift ;;
     --model)   MODEL="${2:-}"; shift 2 ;;
-    --version) echo "localreview $VERSION"; exit 0 ;;
+    --version) echo "mlx-diff $VERSION"; exit 0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "error: unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
@@ -73,7 +73,7 @@ fi
 
 # --- host preflight: MLX is Apple-Silicon-only ---
 if [[ "$(uname -s)/$(uname -m)" != "Darwin/arm64" ]]; then
-  echo "error: localreview requires Apple Silicon macOS — MLX is not supported on $(uname -s)/$(uname -m)." >&2
+  echo "error: mlx-diff requires Apple Silicon macOS — MLX is not supported on $(uname -s)/$(uname -m)." >&2
   echo "       Run it on a Mac or a macOS-on-Apple-Silicon VM." >&2
   exit 1
 fi
