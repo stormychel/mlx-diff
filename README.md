@@ -20,16 +20,25 @@ Skip the (large) model pre-pull with `MLXDIFF_SKIP_PULL=1 ./install.sh` — the 
 
 ## Choosing a model
 
-The installer detects your system RAM, fetches the real (`.safetensors`) size of each curated coder model from HuggingFace, and color-ranks how well each fits. Bigger model = smarter, so the target is ~half your RAM (leaving room for the OS, other apps, and MLX's KV cache):
+On install, `mlx-diff` detects your system RAM, fetches the real (`.safetensors`) size of each curated coder model from HuggingFace, and color-ranks how well each fits — flagging the ones you already have downloaded. Bigger model = smarter, so the target is ~half your RAM (leaving room for the OS, other apps, and MLX's KV cache):
 
-```
-Detected 64 GB system RAM. Sizing coder models…
+```text
+==> Detected 64 GB system RAM. Sizing coder models (fetching live sizes)…
 
-  6) PERFECT  30 GB  Qwen3-Coder-30B-A3B-Instruct-8bit
-  7) PERFECT  32 GB  Qwen2.5-Coder-32B-Instruct-8bit   ← recommended
+   1) ROOMY     3 GB  Qwen2.5-Coder-3B-Instruct-8bit
+   2) ROOMY     7 GB  Qwen2.5-Coder-7B-Instruct-8bit
+   3) ROOMY    14 GB  Qwen2.5-Coder-14B-Instruct-8bit
+   4) ROOMY    16 GB  Qwen3-Coder-30B-A3B-Instruct-4bit
+   5) ROOMY    17 GB  Qwen2.5-Coder-32B-Instruct-4bit
+   6) PERFECT  30 GB  Qwen3-Coder-30B-A3B-Instruct-8bit    ✓ installed
+   7) PERFECT  32 GB  Qwen2.5-Coder-32B-Instruct-8bit      ← recommended
 
   BAD >¾ RAM   TOUGH >½   PERFECT ≈½   ROOMY <½ (safe, smaller)
+
+Pick a model [7]:
 ```
+
+Each fit label is color-coded in a real terminal, and `✓ installed` marks models already in your HuggingFace cache (no download needed). Press Enter to take the recommendation, or type a number.
 
 | Fit | Size vs RAM | Meaning |
 |-----|-------------|---------|
