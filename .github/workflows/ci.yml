@@ -13,11 +13,14 @@ jobs:
 
       - name: shellcheck
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y shellcheck
-          shellcheck bin/mlx-diff install.sh
+          # Pin to match the version developers run locally (avoids SC drift).
+          VER=v0.11.0
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/$VER/shellcheck-$VER.linux.x86_64.tar.xz" | tar -xJ
+          "shellcheck-$VER/shellcheck" --version
+          "shellcheck-$VER/shellcheck" bin/mlx-diff install.sh
 
       - name: bats smoke tests
         run: |
+          sudo apt-get update -qq
           sudo apt-get install -y bats
           bats test/smoke.bats

@@ -297,7 +297,7 @@ PY
 }
 
 EPHEMERAL_PID=""
-cleanup() { [[ -n "$EPHEMERAL_PID" ]] && kill "$EPHEMERAL_PID" 2>/dev/null || true; }
+cleanup() { if [[ -n "$EPHEMERAL_PID" ]]; then kill "$EPHEMERAL_PID" 2>/dev/null || true; fi; }
 trap cleanup EXIT
 
 start_ephemeral_server() {         # loads the model once for chunked reviews
