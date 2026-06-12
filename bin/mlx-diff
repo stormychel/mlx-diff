@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 REPO_SLUG="stormychel/mlx-diff"
 DEFAULT_MODEL="mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit"
 FAST_MODEL="mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
@@ -19,7 +19,9 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mlx-diff"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mlx-diff"
 LOG_FILE="${MLXDIFF_LOG:-$STATE_DIR/runs.jsonl}"
 
-SYS_DEFAULT='You are a senior code reviewer. Review ONLY the provided git diff. Report real correctness bugs, lifecycle/concurrency pitfalls, retain cycles, resource leaks, and regressions. Rules: output each finding on ONE line as "<P1|P2|P3>  <file:line>  <one-line description>" (use the changed line number when you can). P1=ship-blocker, P2=should-fix, P3=minor. Report at most 15 findings, most important first. Report each issue ONCE — never enumerate individual constants/magic numbers and never list near-duplicate findings; group related issues into a single line. If nothing substantive is wrong, output exactly: No substantive findings. Do not restate the diff or explain what the code does.'
+SYS_DEFAULT='You are a senior code reviewer. Review ONLY the provided git diff. Report real bugs: correctness errors, crashes / nil-dereferences, concurrency and lifecycle issues, retain cycles, resource leaks, injection or unsafe eval, missing error handling, and regressions. Start each finding on its own line with a bare severity tag — P1 (ship-blocker), P2 (should-fix), or P3 (minor) — then the file:line, then a one-line description. Do NOT wrap the tag in brackets. Example:
+P2  src/Foo.swift:42  force-unwrap can crash when the response is nil
+Report at most 15 findings, most important first. Report each issue ONCE; never enumerate individual constants / magic numbers and never list near-duplicate findings. If nothing substantive is wrong, output exactly: No substantive findings. Do not restate the diff or explain what the code does.'
 
 # ---------------------------------------------------------------------------
 # Config: built-in defaults < ~/.config/mlx-diff/{model,config} < repo .mlx-diffrc
@@ -58,7 +60,7 @@ MODEL="${MLXDIFF_MODEL:-${CFG_MODEL:-$DEFAULT_MODEL}}"
 MAX_TOKENS="${MLXDIFF_MAX_TOKENS:-${CFG_MAX_TOKENS:-1200}}"
 TEMP="${MLXDIFF_TEMP:-${CFG_TEMP:-0.2}}"
 MIN_SEVERITY="${MLXDIFF_MIN_SEVERITY:-${CFG_MIN_SEVERITY:-P3}}"
-CHUNK_BYTES="${MLXDIFF_CHUNK_BYTES:-${CFG_CHUNK_BYTES:-60000}}"
+CHUNK_BYTES="${MLXDIFF_CHUNK_BYTES:-${CFG_CHUNK_BYTES:-250000}}"
 SERVER_URL="${MLXDIFF_SERVER_URL:-${CFG_SERVER_URL:-}}"
 PROMPT_FILE="${MLXDIFF_PROMPT_FILE:-${CFG_PROMPT_FILE:-}}"
 
@@ -263,21 +265,26 @@ spinner_wait() {                   # $1 = pid, $2 = label
 }
 
 oneshot_generate() {               # stdin: diff ; stdout: review ; $1 = label
-  local out; out="$(mktemp)"
+  # Capture the diff to a file and feed it with an EXPLICIT redirect: a
+  # backgrounded command (for the spinner) otherwise gets stdin from /dev/null,
+  # so --prompt - would read nothing and the model would review an empty diff.
+  local out in; out="$(mktemp)"; in="$(mktemp)"; cat > "$in"
   if model_cached; then
     mlx_lm.generate --model "$MODEL" --system-prompt "$SYS" --prompt - \
-      --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False >"$out" 2>/dev/null &
+      --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False <"$in" >"$out" 2>/dev/null &
     spinner_wait $! "$1"
   else
     printf '↓ mlx-diff: downloading %s (first run — fetching weights; cached after this)…\n' "$MODEL_SHORT" >&2
     mlx_lm.generate --model "$MODEL" --system-prompt "$SYS" --prompt - \
-      --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False >"$out" || true
+      --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False <"$in" >"$out" || true
   fi
-  cat "$out"; rm -f "$out"
+  cat "$out"; rm -f "$out" "$in"
 }
 
 server_generate() {                # stdin: diff ; stdout: review
-  python3 - "$SERVER_URL" "$MODEL" "$MAX_TOKENS" "$TEMP" "$SYS" <<'PY'
+  # NB: use `python3 -c` (not `python3 - <<HEREDOC`), otherwise python reads its
+  # program from stdin and the diff piped on stdin is consumed before we read it.
+  python3 -c '
 import sys, json, urllib.request
 url, model, maxtok, temp, sysp = sys.argv[1:6]
 diff = sys.stdin.read()
@@ -286,43 +293,27 @@ body = json.dumps({"model": model,
                                 {"role": "user", "content": diff}],
                    "max_tokens": int(maxtok), "temperature": float(temp),
                    "repetition_penalty": 1.1}).encode()
-req = urllib.request.Request(url.rstrip('/') + "/v1/chat/completions", data=body,
+req = urllib.request.Request(url.rstrip("/") + "/v1/chat/completions", data=body,
                              headers={"Content-Type": "application/json"})
 try:
     r = json.load(urllib.request.urlopen(req, timeout=900))
     print(r["choices"][0]["message"]["content"])
 except Exception as e:
-    sys.stderr.write(f"server error: {e}\n")
-PY
-}
-
-EPHEMERAL_PID=""
-cleanup() { if [[ -n "$EPHEMERAL_PID" ]]; then kill "$EPHEMERAL_PID" 2>/dev/null || true; fi; }
-trap cleanup EXIT
-
-start_ephemeral_server() {         # loads the model once for chunked reviews
-  local port=8765
-  command -v curl >/dev/null 2>&1 || return 1
-  mlx_lm.server --model "$MODEL" --host 127.0.0.1 --port "$port" >/dev/null 2>&1 &
-  EPHEMERAL_PID=$!
-  SERVER_URL="http://127.0.0.1:$port"
-  local i
-  for i in $(seq 1 180); do
-    kill -0 "$EPHEMERAL_PID" 2>/dev/null || return 1
-    curl -fsS -m 2 "$SERVER_URL/v1/models" >/dev/null 2>&1 && return 0
-    sleep 1
-  done
-  return 1
+    sys.stderr.write("server error: %s\n" % e)
+' "$SERVER_URL" "$MODEL" "$MAX_TOKENS" "$TEMP" "$SYS"
 }
 
 generate() {                       # stdin: diff ; stdout: review ; $1 = label
-  if [[ "$USE_SERVER" -eq 1 || -n "$EPHEMERAL_PID" ]]; then server_generate; else oneshot_generate "$1"; fi
+  # Each review is a fresh process: mlx_lm.server reuses KV-cache state across
+  # requests and degrades after the first, so we don't pool it. --server is an
+  # explicit opt-in for users running their own.
+  if [[ "$USE_SERVER" -eq 1 ]]; then server_generate; else oneshot_generate "$1"; fi
 }
 
 # ---------------------------------------------------------------------------
-# Run the review — chunk large diffs per-file (#11), which also curbs the
-# repetition seen on huge prompts (#18). Chunking loads the model once via an
-# ephemeral server so N files don't mean N cold loads.
+# Run the review. A single one-shot review handles realistic diffs (Qwen3-Coder
+# has a 256k context) and the hardened prompt curbs repetition (#18). Only a diff
+# above CHUNK_BYTES is split per-file (#11), reviewed one fresh process per file.
 # ---------------------------------------------------------------------------
 printf '→ mlx-diff: reviewing %s · %s · %d KB\n' "$SOURCE" "$MODEL_SHORT" "$(( (DIFF_BYTES + 1023) / 1024 ))" >&2
 
@@ -335,24 +326,15 @@ if [[ "$NOCHUNK" -eq 0 && "$DIFF_BYTES" -gt "$CHUNK_BYTES" ]]; then
   CHUNKS=()
   while IFS= read -r _c; do CHUNKS+=("$_c"); done < <(find "$CHUNK_DIR" -name '*.diff' | sort)
   echo "  large diff — reviewing ${#CHUNKS[@]} files separately" >&2
-
-  if [[ "$USE_SERVER" -eq 0 ]] && model_cached; then
-    echo "  starting a local MLX server (loads the model once)…" >&2
-    start_ephemeral_server || { echo "  server unavailable — falling back to one prompt" >&2; NOCHUNK=1; }
-  fi
-
-  if [[ "$NOCHUNK" -eq 0 ]]; then
-    REVIEW=""
-    k=0
-    for c in "${CHUNKS[@]}"; do
-      k=$(( k + 1 ))
-      fname="$(sed -n 's/^diff --git a\/\([^ ]*\).*/\1/p' "$c" | head -1)"
-      printf '  [%d/%d] %s\n' "$k" "${#CHUNKS[@]}" "${fname:-chunk $k}" >&2
-      part="$(generate "reviewing" < "$c")"
-      [[ "$part" =~ [^[:space:]] ]] && REVIEW+="${REVIEW:+$'\n'}$part"
-    done
-    rm -rf "$CHUNK_DIR"
-  fi
+  REVIEW=""
+  k=0
+  for c in "${CHUNKS[@]}"; do
+    k=$(( k + 1 ))
+    fname="$(sed -n 's/^diff --git a\/\([^ ]*\).*/\1/p' "$c" | head -1)"
+    part="$(generate "[$k/${#CHUNKS[@]}] ${fname:-chunk $k}" < "$c")"
+    [[ "$part" =~ [^[:space:]] ]] && REVIEW+="${REVIEW:+$'\n'}$part"
+  done
+  rm -rf "$CHUNK_DIR"
 fi
 
 if [[ -z "${REVIEW:-}" ]]; then
@@ -367,6 +349,8 @@ fi
 # ---------------------------------------------------------------------------
 # Severity filter (#12) and de-dup of the "No substantive findings" noise.
 # ---------------------------------------------------------------------------
+# Normalize any "<P1>" tags the model emits despite instructions, back to "P1".
+REVIEW="$(sed -E 's/^[[:space:]]*<(P[123])>/\1/' <<<"$REVIEW")"
 REVIEW="$(awk -v max="$MINSEV_NUM" '
   $1 ~ /^P[123]$/ { sev = substr($1,2,1)+0; if (sev <= max) print; next }
   /No substantive findings/ { next }     # drop per-chunk "nothing here" lines
@@ -402,7 +386,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 n_findings="$(grep -cE '^[[:space:]]*P[123][[:space:]]' <<<"$REVIEW" || true)"
 printf '{"ts":"%s","engine":"%s","model":"%s","source":"%s","repo":"%s","findings":%s,"posted":%s}\n' \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  "$([[ "$USE_SERVER" -eq 1 || -n "$EPHEMERAL_PID" ]] && echo server || echo mlx)" \
+  "$([[ "$USE_SERVER" -eq 1 ]] && echo server || echo mlx)" \
   "$(json_escape "$MODEL")" "$(json_escape "$SOURCE")" \
   "$(json_escape "$(git rev-parse --show-toplevel 2>/dev/null || echo '')")" \
   "${n_findings:-0}" "$([[ "$COMMENT" -eq 1 || "$INLINE" -eq 1 ]] && echo true || echo false)" \

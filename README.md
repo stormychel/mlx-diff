@@ -114,12 +114,9 @@ The install-time model choice is stored at `~/.config/mlx-diff/model`.
 
 ## Large diffs & server mode
 
-- **Chunking** — diffs over `MLXDIFF_CHUNK_BYTES` (60 KB) are reviewed **one file at a time**, which keeps prompts small and avoids the model degenerating into repeated findings on huge inputs. To keep the model loaded across chunks, mlx-diff spins up a short-lived local MLX server for the run and tears it down after.
-- **Persistent server** — keep a model warm so repeat reviews skip the cold load:
-  ```bash
-  mlx-diff --serve &                 # serves the current model on :8080
-  mlx-diff --base main --server      # reuses it; near-instant
-  ```
+- **One-shot by default** — each review is a single fresh `mlx_lm.generate` call. Qwen3-Coder's 256k context handles realistic diffs in one pass, and the hardened prompt curbs repetition, so chunking is rarely needed.
+- **Chunking** — only diffs over `MLXDIFF_CHUNK_BYTES` (250 KB) are split and reviewed **one file at a time**, each in its own fresh process. Disable with `--no-chunk`.
+- **Server mode** (`--server` / `--serve`) — opt-in, for pointing reviews at your own `mlx_lm.server`. Note: `mlx_lm.server` reuses KV-cache state across requests and the review quality can degrade after the first request, so one-shot (the default) is recommended for reliability.
 
 ## Updating
 
