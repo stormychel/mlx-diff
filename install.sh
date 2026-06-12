@@ -43,10 +43,12 @@ else
   say "mlx-lm already installed: $(command -v mlx_lm.generate)"
 fi
 
-# 4. Pre-pull the default model (so first review isn't a cold 32 GB download).
+# 4. Pre-pull the default model (so first review isn't a cold multi-GB download).
+#    stderr is left attached so HuggingFace's download progress bars are visible;
+#    only stdout (the throwaway generation) is discarded.
 if [[ "${MLXDIFF_SKIP_PULL:-0}" != "1" ]]; then
   say "Pre-pulling model: $DEFAULT_MODEL (this can be large; set MLXDIFF_SKIP_PULL=1 to skip)…"
-  if mlx_lm.generate --model "$DEFAULT_MODEL" --prompt "ok" --max-tokens 1 >/dev/null 2>&1; then
+  if mlx_lm.generate --model "$DEFAULT_MODEL" --prompt "ok" --max-tokens 1 --verbose False >/dev/null; then
     say "Model ready."
   else
     say "Model pull/warm-up failed or was interrupted — it will download on first real review."
