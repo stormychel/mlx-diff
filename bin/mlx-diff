@@ -6,30 +6,65 @@
 #  Created by Michel Storms on 12/06/2026.
 #
 #  Reviews a git diff (or a GitHub PR) with a local MLX model on Apple Silicon.
-#  Default model: mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit.
 #  Fully offline and quota-free. Every run is logged to runs.jsonl for tracing.
 
 set -euo pipefail
 
-VERSION="0.3.1"
+VERSION="0.4.0"
+REPO_SLUG="stormychel/mlx-diff"
+DEFAULT_MODEL="mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit"
+FAST_MODEL="mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
 
-# Model resolution: --model flag (parsed below) > $MLXDIFF_MODEL > install-time
-# choice in the config file > built-in default.
-CONFIG_MODEL=""
-_model_cfg="${XDG_CONFIG_HOME:-$HOME/.config}/mlx-diff/model"
-[[ -r "$_model_cfg" ]] && CONFIG_MODEL="$(tr -d '[:space:]' < "$_model_cfg")"
-MODEL="${MLXDIFF_MODEL:-${CONFIG_MODEL:-mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit}}"
-MAX_TOKENS="${MLXDIFF_MAX_TOKENS:-2000}"
-TEMP="${MLXDIFF_TEMP:-0.2}"
-
-BASE=""
-PR=""
-COMMENT=0
-
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/mlx-diff"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/mlx-diff"
 LOG_FILE="${MLXDIFF_LOG:-$STATE_DIR/runs.jsonl}"
 
-SYS='You are a senior code reviewer. Review ONLY the provided git diff. Focus on real correctness bugs, lifecycle/concurrency pitfalls, retain cycles, resource leaks, and regressions. Be concise. For each finding output one line in the form: <P1|P2|P3>  <file:area>  <one-line description>. P1=ship-blocker, P2=should-fix, P3=minor. If nothing substantive is wrong, output exactly: No substantive findings. Do not restate the diff or explain what the code does.'
+SYS_DEFAULT='You are a senior code reviewer. Review ONLY the provided git diff. Report real correctness bugs, lifecycle/concurrency pitfalls, retain cycles, resource leaks, and regressions. Rules: output each finding on ONE line as "<P1|P2|P3>  <file:line>  <one-line description>" (use the changed line number when you can). P1=ship-blocker, P2=should-fix, P3=minor. Report at most 15 findings, most important first. Report each issue ONCE — never enumerate individual constants/magic numbers and never list near-duplicate findings; group related issues into a single line. If nothing substantive is wrong, output exactly: No substantive findings. Do not restate the diff or explain what the code does.'
+
+# ---------------------------------------------------------------------------
+# Config: built-in defaults < ~/.config/mlx-diff/{model,config} < repo .mlx-diffrc
+#         < environment < command-line flags.
+# ---------------------------------------------------------------------------
+CFG_MODEL=""; CFG_BASE=""; CFG_MAX_TOKENS=""; CFG_TEMP=""
+CFG_MIN_SEVERITY=""; CFG_PROMPT_FILE=""; CFG_CHUNK_BYTES=""; CFG_SERVER_URL=""
+
+load_cfg() {                       # $1 = config file (KEY=value lines)
+  local f="$1" key val
+  [[ -r "$f" ]] || return 0
+  while IFS='=' read -r key val; do
+    key="${key#"${key%%[![:space:]]*}"}"; key="${key%"${key##*[![:space:]]}"}"
+    [[ -z "$key" || "$key" == \#* ]] && continue
+    val="${val%$'\r'}"; val="${val#"${val%%[![:space:]]*}"}"
+    val="${val%\"}"; val="${val#\"}"
+    case "$key" in
+      model)        CFG_MODEL="$val" ;;
+      base)         CFG_BASE="$val" ;;
+      max_tokens)   CFG_MAX_TOKENS="$val" ;;
+      temp)         CFG_TEMP="$val" ;;
+      min_severity) CFG_MIN_SEVERITY="$val" ;;
+      prompt_file)  CFG_PROMPT_FILE="$val" ;;
+      chunk_bytes)  CFG_CHUNK_BYTES="$val" ;;
+      server_url)   CFG_SERVER_URL="$val" ;;
+    esac
+  done < "$f"
+}
+
+# Back-compat: the installer writes just the model id to <config>/model.
+[[ -r "$CONFIG_DIR/model" ]] && CFG_MODEL="$(tr -d '[:space:]' < "$CONFIG_DIR/model")"
+load_cfg "$CONFIG_DIR/config"
+load_cfg "./.mlx-diffrc"
+
+MODEL="${MLXDIFF_MODEL:-${CFG_MODEL:-$DEFAULT_MODEL}}"
+MAX_TOKENS="${MLXDIFF_MAX_TOKENS:-${CFG_MAX_TOKENS:-1200}}"
+TEMP="${MLXDIFF_TEMP:-${CFG_TEMP:-0.2}}"
+MIN_SEVERITY="${MLXDIFF_MIN_SEVERITY:-${CFG_MIN_SEVERITY:-P3}}"
+CHUNK_BYTES="${MLXDIFF_CHUNK_BYTES:-${CFG_CHUNK_BYTES:-60000}}"
+SERVER_URL="${MLXDIFF_SERVER_URL:-${CFG_SERVER_URL:-}}"
+PROMPT_FILE="${MLXDIFF_PROMPT_FILE:-${CFG_PROMPT_FILE:-}}"
+
+BASE="${CFG_BASE:-}"
+PR=""; COMMENT=0; INLINE=0; FAST=0; JSON=0; NOCHUNK=0; USE_SERVER=0
+SERVE=0; DO_UPDATE=0; MODEL_EXPLICIT=0
 
 usage() {
   cat <<EOF
@@ -37,50 +72,102 @@ mlx-diff $VERSION — review a git diff or GitHub PR with a local MLX model.
 
 Usage: mlx-diff [options]
 
-Options:
-  --base <branch>   Base branch to diff against (default: auto-detect main/master)
-  --pr <number>     Review a GitHub PR diff instead of the local branch
-  --comment         Post the review as a comment on the PR (requires --pr)
-  --model <name>    MLX model repo (default: \$MLXDIFF_MODEL or the bundled Qwen3-Coder)
-  --version         Print version and exit
-  -h, --help        Show this help
+Source:
+  --base <branch>       Diff against a base branch (default: auto-detect main/master)
+  --pr <number>         Review a GitHub PR diff instead of the local branch
 
-Environment:
-  MLXDIFF_MODEL       Default model repo
-  MLXDIFF_MAX_TOKENS  Max generated tokens (default: 2000)
-  MLXDIFF_TEMP        Sampling temperature (default: 0.2)
-  MLXDIFF_LOG         Path to the run log (default: \$XDG_STATE_HOME/mlx-diff/runs.jsonl)
+Output:
+  --comment             Post the review as a single PR comment (requires --pr)
+  --inline              Post findings as inline PR review comments (requires --pr)
+  --json                Emit findings as a JSON array instead of text
+  --min-severity <P1|P2|P3>
+                        Drop findings below this severity (default: P3 = keep all)
 
-Examples:
-  mlx-diff --base main
-  mlx-diff --model mlx-community/Qwen2.5-Coder-32B-Instruct-8bit
-  mlx-diff --pr 42 --comment
+Model:
+  --model <repo>        MLX model repo
+  --fast                Use the 4-bit model (smaller/faster); or swap 8bit→4bit in --model
+  --server [url]        Use an OpenAI-compatible MLX server (default: http://127.0.0.1:8080)
+  --serve               Start mlx_lm.server for the current model and exit
+  --no-chunk            Don't split large diffs (review the whole diff in one prompt)
+
+Maintenance:
+  --update              Update mlx-diff to the latest release (git pull) and exit
+  --version             Print version and exit
+  -h, --help            Show this help
+
+Config (lowest→highest precedence): defaults < ~/.config/mlx-diff/{model,config}
+< ./.mlx-diffrc < env (MLXDIFF_*) < flags. Run log: $LOG_FILE
 EOF
 }
 
-# --- arg parsing (handled before any host preflight so --help/--version work anywhere) ---
+# ---------------------------------------------------------------------------
+# Argument parsing.
+# ---------------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base)    BASE="${2:-}"; shift 2 ;;
-    --pr)      PR="${2:-}"; shift 2 ;;
-    --comment) COMMENT=1; shift ;;
-    --model)   MODEL="${2:-}"; shift 2 ;;
-    --version) echo "mlx-diff $VERSION"; exit 0 ;;
-    -h|--help) usage; exit 0 ;;
+    --base)         BASE="${2:-}"; shift 2 ;;
+    --pr)           PR="${2:-}"; shift 2 ;;
+    --comment)      COMMENT=1; shift ;;
+    --inline)       INLINE=1; shift ;;
+    --json)         JSON=1; shift ;;
+    --min-severity) MIN_SEVERITY="${2:-}"; shift 2 ;;
+    --model)        MODEL="${2:-}"; MODEL_EXPLICIT=1; shift 2 ;;
+    --fast)         FAST=1; shift ;;
+    --server)       USE_SERVER=1
+                    if [[ "${2:-}" == http* ]]; then SERVER_URL="$2"; shift 2; else shift; fi ;;
+    --serve)        SERVE=1; shift ;;
+    --no-chunk)     NOCHUNK=1; shift ;;
+    --update)       DO_UPDATE=1; shift ;;
+    --version)      echo "mlx-diff $VERSION"; exit 0 ;;
+    -h|--help)      usage; exit 0 ;;
     *) echo "error: unknown option: $1" >&2; usage >&2; exit 1 ;;
   esac
 done
 
-if [[ "$COMMENT" -eq 1 && -z "$PR" ]]; then
-  echo "error: --comment requires --pr <number>" >&2
-  exit 1
+case "$MIN_SEVERITY" in P1|P2|P3) ;; *) echo "error: --min-severity must be P1, P2, or P3" >&2; exit 1 ;; esac
+MINSEV_NUM="${MIN_SEVERITY#P}"
+[[ "$COMMENT" -eq 1 && -z "$PR" ]] && { echo "error: --comment requires --pr <number>" >&2; exit 1; }
+[[ "$INLINE"  -eq 1 && -z "$PR" ]] && { echo "error: --inline requires --pr <number>" >&2; exit 1; }
+[[ -n "$SERVER_URL" ]] && USE_SERVER=1
+[[ "$USE_SERVER" -eq 1 && -z "$SERVER_URL" ]] && SERVER_URL="http://127.0.0.1:8080"
+
+# Fast mode: pick the 4-bit model (or rewrite an explicit 8bit repo to 4bit).
+if [[ "$FAST" -eq 1 ]]; then
+  if [[ "$MODEL_EXPLICIT" -eq 1 ]]; then MODEL="${MODEL/8bit/4bit}"; else MODEL="$FAST_MODEL"; fi
+fi
+MODEL_SHORT="${MODEL##*/}"
+
+# Custom prompt.
+SYS="$SYS_DEFAULT"
+if [[ -n "$PROMPT_FILE" ]]; then
+  [[ -r "$PROMPT_FILE" ]] || { echo "error: prompt file not readable: $PROMPT_FILE" >&2; exit 1; }
+  SYS="$(cat "$PROMPT_FILE")"
 fi
 
-# --- host preflight: MLX is Apple-Silicon-only ---
-if [[ "$(uname -s)/$(uname -m)" != "Darwin/arm64" ]]; then
+# ---------------------------------------------------------------------------
+# Host preflight (skipped for --update so it works to fix a broken install too).
+# ---------------------------------------------------------------------------
+if [[ "$(uname -s)/$(uname -m)" != "Darwin/arm64" && "$DO_UPDATE" -eq 0 ]]; then
   echo "error: mlx-diff requires Apple Silicon macOS — MLX is not supported on $(uname -s)/$(uname -m)." >&2
   echo "       Run it on a Mac or a macOS-on-Apple-Silicon VM." >&2
   exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# --update (#17): git pull the install repo, re-link the CLI.
+# ---------------------------------------------------------------------------
+self_repo_dir() {
+  local self; self="$(cd "$(dirname "$0")" && pwd)"
+  [[ -L "$0" ]] && self="$(cd "$(dirname "$(readlink "$0")")" && pwd)"
+  printf '%s' "$(cd "$self/.." && pwd)"
+}
+if [[ "$DO_UPDATE" -eq 1 ]]; then
+  dir="$(self_repo_dir)"
+  [[ -d "$dir/.git" ]] || { echo "error: not a git checkout: $dir (reinstall from https://github.com/$REPO_SLUG)" >&2; exit 1; }
+  echo "→ updating mlx-diff in $dir …" >&2
+  git -C "$dir" pull --ff-only
+  echo "✓ now on $(cat "$dir/VERSION" 2>/dev/null || echo '?')" >&2
+  exit 0
 fi
 
 command -v mlx_lm.generate >/dev/null 2>&1 || {
@@ -88,7 +175,42 @@ command -v mlx_lm.generate >/dev/null 2>&1 || {
   exit 1
 }
 
-# --- gather the diff ---
+# ---------------------------------------------------------------------------
+# --serve (#16): start an OpenAI-compatible MLX server for this model.
+# ---------------------------------------------------------------------------
+if [[ "$SERVE" -eq 1 ]]; then
+  port="${SERVER_URL##*:}"; [[ "$port" =~ ^[0-9]+$ ]] || port=8080
+  echo "→ serving $MODEL_SHORT on http://127.0.0.1:$port  (Ctrl-C to stop)" >&2
+  echo "  point reviews at it with:  mlx-diff --server --base main" >&2
+  exec mlx_lm.server --model "$MODEL" --host 127.0.0.1 --port "$port"
+fi
+
+# ---------------------------------------------------------------------------
+# Update awareness (#17): at most once/day, note if a newer release exists.
+# ---------------------------------------------------------------------------
+update_check() {
+  [[ "${MLXDIFF_NO_UPDATE_CHECK:-0}" == 1 ]] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+  local stamp="$STATE_DIR/update-check" latest
+  if [[ -f "$stamp" ]]; then
+    local age; age=$(( $(date +%s) - $(stat -f %m "$stamp" 2>/dev/null || echo 0) ))
+    (( age < 86400 )) && { latest="$(cat "$stamp")"; }
+  fi
+  if [[ -z "${latest:-}" ]]; then
+    latest="$(curl -fsS -m 4 "https://api.github.com/repos/$REPO_SLUG/releases/latest" 2>/dev/null \
+              | sed -n 's/.*"tag_name":[[:space:]]*"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)"
+    [[ -n "$latest" ]] && { mkdir -p "$STATE_DIR"; printf '%s' "$latest" > "$stamp"; }
+  fi
+  [[ -z "${latest:-}" ]] && return 0
+  if [[ "$(printf '%s\n%s\n' "$VERSION" "$latest" | sort -V | tail -1)" != "$VERSION" ]]; then
+    echo "↑ mlx-diff $latest available (you have $VERSION) — run: mlx-diff --update" >&2
+  fi
+}
+update_check
+
+# ---------------------------------------------------------------------------
+# Gather the diff.
+# ---------------------------------------------------------------------------
 if [[ -n "$PR" ]]; then
   command -v gh >/dev/null 2>&1 || { echo "error: gh not found on PATH (needed for --pr)" >&2; exit 1; }
   SOURCE="pr#$PR"
@@ -104,27 +226,15 @@ else
   DIFF="$(git diff "${BASE}...HEAD")"
 fi
 
-# Fast, locale-safe "is there any non-whitespace?" check. (A bracket-pattern
-# substitution here is O(n) collation calls under a UTF-8 locale — pathologically
-# slow on large diffs; the regex short-circuits at the first non-space char.)
 if ! [[ "$DIFF" =~ [^[:space:]] ]]; then
   echo "No diff to review." >&2
   exit 0
 fi
-
-# MLX uses the model's full context window, but very large diffs are slow and
-# memory-hungry — warn past a soft threshold.
 DIFF_BYTES=${#DIFF}
-if [[ "$DIFF_BYTES" -gt 200000 ]]; then
-  echo "warning: diff is ${DIFF_BYTES} bytes — review may be slow or exceed the model context." >&2
-fi
 
-MODEL_SHORT="${MODEL##*/}"
-HEADER="## MLX review (\`$MODEL_SHORT\`)"
-
-# Resolve the HuggingFace hub cache dir and check whether this model is present.
-# If not, the first run downloads it (tens of GB) — we then let HF's own progress
-# bars stream through instead of hiding them behind our spinner.
+# ---------------------------------------------------------------------------
+# Model cache check (drives download-progress vs spinner).
+# ---------------------------------------------------------------------------
 hf_hub_dir() {
   if   [[ -n "${HF_HUB_CACHE:-}" ]]; then printf '%s' "$HF_HUB_CACHE"
   elif [[ -n "${HF_HOME:-}" ]];      then printf '%s/hub' "$HF_HOME"
@@ -137,55 +247,204 @@ model_cached() {
   return 1
 }
 
-OUT_FILE="$(mktemp)"
-
-if model_cached; then
-  # --- cached: fast load + generate, with our elapsed-time spinner ---
-  printf '→ mlx-diff: reviewing %s · %s · %d KB\n' "$SOURCE" "$MODEL_SHORT" "$(( (DIFF_BYTES + 1023) / 1024 ))" >&2
-  mlx_lm.generate \
-    --model "$MODEL" --system-prompt "$SYS" --prompt - \
-    --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False \
-    >"$OUT_FILE" 2>/dev/null <<<"$DIFF" &
-  GEN_PID=$!
+# ---------------------------------------------------------------------------
+# Generation back-ends.
+# ---------------------------------------------------------------------------
+spinner_wait() {                   # $1 = pid, $2 = label
   if [[ -t 2 ]]; then
-    FRAMES=$'|/-\\'; spin=0; start=$SECONDS
-    while kill -0 "$GEN_PID" 2>/dev/null; do
-      printf '\r\033[2K  %s loading model + generating… %ds' "${FRAMES:spin:1}" "$((SECONDS - start))" >&2
-      spin=$(( (spin + 1) % ${#FRAMES} ))
-      sleep 0.1
+    local frames=$'|/-\\' i=0 start=$SECONDS
+    while kill -0 "$1" 2>/dev/null; do
+      printf '\r\033[2K  %s %s… %ds' "${frames:i:1}" "$2" "$((SECONDS - start))" >&2
+      i=$(( (i + 1) % ${#frames} )); sleep 0.1
     done
     printf '\r\033[2K' >&2
   fi
-  wait "$GEN_PID" || true
-else
-  # --- first run: stream HuggingFace download progress, then generate ---
-  printf '↓ mlx-diff: downloading %s (first run — fetching weights; cached after this)…\n' "$MODEL_SHORT" >&2
-  mlx_lm.generate \
-    --model "$MODEL" --system-prompt "$SYS" --prompt - \
-    --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False \
-    >"$OUT_FILE" <<<"$DIFF" || true
-  printf '→ mlx-diff: reviewed %s · %s\n' "$SOURCE" "$MODEL_SHORT" >&2
+  wait "$1" || true
+}
+
+oneshot_generate() {               # stdin: diff ; stdout: review ; $1 = label
+  local out; out="$(mktemp)"
+  if model_cached; then
+    mlx_lm.generate --model "$MODEL" --system-prompt "$SYS" --prompt - \
+      --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False >"$out" 2>/dev/null &
+    spinner_wait $! "$1"
+  else
+    printf '↓ mlx-diff: downloading %s (first run — fetching weights; cached after this)…\n' "$MODEL_SHORT" >&2
+    mlx_lm.generate --model "$MODEL" --system-prompt "$SYS" --prompt - \
+      --max-tokens "$MAX_TOKENS" --temp "$TEMP" --verbose False >"$out" || true
+  fi
+  cat "$out"; rm -f "$out"
+}
+
+server_generate() {                # stdin: diff ; stdout: review
+  python3 - "$SERVER_URL" "$MODEL" "$MAX_TOKENS" "$TEMP" "$SYS" <<'PY'
+import sys, json, urllib.request
+url, model, maxtok, temp, sysp = sys.argv[1:6]
+diff = sys.stdin.read()
+body = json.dumps({"model": model,
+                   "messages": [{"role": "system", "content": sysp},
+                                {"role": "user", "content": diff}],
+                   "max_tokens": int(maxtok), "temperature": float(temp),
+                   "repetition_penalty": 1.1}).encode()
+req = urllib.request.Request(url.rstrip('/') + "/v1/chat/completions", data=body,
+                             headers={"Content-Type": "application/json"})
+try:
+    r = json.load(urllib.request.urlopen(req, timeout=900))
+    print(r["choices"][0]["message"]["content"])
+except Exception as e:
+    sys.stderr.write(f"server error: {e}\n")
+PY
+}
+
+EPHEMERAL_PID=""
+cleanup() { [[ -n "$EPHEMERAL_PID" ]] && kill "$EPHEMERAL_PID" 2>/dev/null || true; }
+trap cleanup EXIT
+
+start_ephemeral_server() {         # loads the model once for chunked reviews
+  local port=8765
+  command -v curl >/dev/null 2>&1 || return 1
+  mlx_lm.server --model "$MODEL" --host 127.0.0.1 --port "$port" >/dev/null 2>&1 &
+  EPHEMERAL_PID=$!
+  SERVER_URL="http://127.0.0.1:$port"
+  local i
+  for i in $(seq 1 180); do
+    kill -0 "$EPHEMERAL_PID" 2>/dev/null || return 1
+    curl -fsS -m 2 "$SERVER_URL/v1/models" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+generate() {                       # stdin: diff ; stdout: review ; $1 = label
+  if [[ "$USE_SERVER" -eq 1 || -n "$EPHEMERAL_PID" ]]; then server_generate; else oneshot_generate "$1"; fi
+}
+
+# ---------------------------------------------------------------------------
+# Run the review — chunk large diffs per-file (#11), which also curbs the
+# repetition seen on huge prompts (#18). Chunking loads the model once via an
+# ephemeral server so N files don't mean N cold loads.
+# ---------------------------------------------------------------------------
+printf '→ mlx-diff: reviewing %s · %s · %d KB\n' "$SOURCE" "$MODEL_SHORT" "$(( (DIFF_BYTES + 1023) / 1024 ))" >&2
+
+if [[ "$NOCHUNK" -eq 0 && "$DIFF_BYTES" -gt "$CHUNK_BYTES" ]]; then
+  CHUNK_DIR="$(mktemp -d)"
+  awk -v dir="$CHUNK_DIR" '
+    /^diff --git / { n++; file=sprintf("%s/%04d.diff", dir, n) }
+    n > 0 { print > file }
+  ' <<<"$DIFF"
+  CHUNKS=()
+  while IFS= read -r _c; do CHUNKS+=("$_c"); done < <(find "$CHUNK_DIR" -name '*.diff' | sort)
+  echo "  large diff — reviewing ${#CHUNKS[@]} files separately" >&2
+
+  if [[ "$USE_SERVER" -eq 0 ]] && model_cached; then
+    echo "  starting a local MLX server (loads the model once)…" >&2
+    start_ephemeral_server || { echo "  server unavailable — falling back to one prompt" >&2; NOCHUNK=1; }
+  fi
+
+  if [[ "$NOCHUNK" -eq 0 ]]; then
+    REVIEW=""
+    k=0
+    for c in "${CHUNKS[@]}"; do
+      k=$(( k + 1 ))
+      fname="$(sed -n 's/^diff --git a\/\([^ ]*\).*/\1/p' "$c" | head -1)"
+      printf '  [%d/%d] %s\n' "$k" "${#CHUNKS[@]}" "${fname:-chunk $k}" >&2
+      part="$(generate "reviewing" < "$c")"
+      [[ "$part" =~ [^[:space:]] ]] && REVIEW+="${REVIEW:+$'\n'}$part"
+    done
+    rm -rf "$CHUNK_DIR"
+  fi
 fi
 
-REVIEW="$(cat "$OUT_FILE")"
-rm -f "$OUT_FILE"
+if [[ -z "${REVIEW:-}" ]]; then
+  REVIEW="$(generate "loading model + generating" <<<"$DIFF")"
+fi
 
 if ! [[ "$REVIEW" =~ [^[:space:]] ]]; then
   echo "error: model returned no output — check the model is available and there is enough memory." >&2
   exit 1
 fi
 
-# --- trace: append a structured record of this run ---
+# ---------------------------------------------------------------------------
+# Severity filter (#12) and de-dup of the "No substantive findings" noise.
+# ---------------------------------------------------------------------------
+REVIEW="$(awk -v max="$MINSEV_NUM" '
+  $1 ~ /^P[123]$/ { sev = substr($1,2,1)+0; if (sev <= max) print; next }
+  /No substantive findings/ { next }     # drop per-chunk "nothing here" lines
+  { print }
+' <<<"$REVIEW")"
+[[ "$REVIEW" =~ [^[:space:]] ]] || REVIEW="No substantive findings."
+
+# ---------------------------------------------------------------------------
+# Structured output (#4).
+# ---------------------------------------------------------------------------
+to_json() {
+  awk '
+    BEGIN { printf "["; first=1 }
+    $1 ~ /^P[123]$/ {
+      sev=$1; loc=$2; desc=""
+      for (i=3;i<=NF;i++) desc = desc (i>3?" ":"") $i
+      gsub(/\\/,"\\\\",desc); gsub(/"/,"\\\"",desc)
+      gsub(/\\/,"\\\\",loc);  gsub(/"/,"\\\"",loc)
+      if (!first) printf ","; first=0
+      printf "{\"severity\":\"%s\",\"location\":\"%s\",\"description\":\"%s\"}", sev, loc, desc
+    }
+    END { print "]" }
+  ' <<<"$1"
+}
+
+HEADER="## MLX review (\`$MODEL_SHORT\`)"
+
+# ---------------------------------------------------------------------------
+# Trace log (#tracing).
+# ---------------------------------------------------------------------------
 json_escape() { local s="${1//\\/\\\\}"; s="${s//\"/\\\"}"; printf '%s' "$s"; }
 mkdir -p "$(dirname "$LOG_FILE")"
-TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo '')"
-printf '{"ts":"%s","engine":"mlx","model":"%s","source":"%s","repo":"%s","review_chars":%d,"posted":%s}\n' \
-  "$TS" "$(json_escape "$MODEL")" "$(json_escape "$SOURCE")" "$(json_escape "$REPO_ROOT")" \
-  "${#REVIEW}" "$([[ "$COMMENT" -eq 1 ]] && echo true || echo false)" >> "$LOG_FILE"
+n_findings="$(grep -cE '^[[:space:]]*P[123][[:space:]]' <<<"$REVIEW" || true)"
+printf '{"ts":"%s","engine":"%s","model":"%s","source":"%s","repo":"%s","findings":%s,"posted":%s}\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  "$([[ "$USE_SERVER" -eq 1 || -n "$EPHEMERAL_PID" ]] && echo server || echo mlx)" \
+  "$(json_escape "$MODEL")" "$(json_escape "$SOURCE")" \
+  "$(json_escape "$(git rev-parse --show-toplevel 2>/dev/null || echo '')")" \
+  "${n_findings:-0}" "$([[ "$COMMENT" -eq 1 || "$INLINE" -eq 1 ]] && echo true || echo false)" \
+  >> "$LOG_FILE"
 
-# --- emit or post ---
-if [[ "$COMMENT" -eq 1 && -n "$PR" ]]; then
+# ---------------------------------------------------------------------------
+# Inline PR comments (#14) — best-effort line anchoring from "file:line".
+# ---------------------------------------------------------------------------
+post_inline() {
+  local owner_repo head_sha
+  owner_repo="$(gh repo view --json nameWithOwner -q .nameWithOwner)"
+  head_sha="$(gh pr view "$PR" --json headRefOid -q .headRefOid)"
+  local comments; comments="$(awk '
+    BEGIN { printf "["; first=1 }
+    $1 ~ /^P[123]$/ {
+      loc=$2; n=split(loc, a, ":"); if (n<2 || a[n] !~ /^[0-9]+$/) next
+      line=a[n]; path=substr(loc,1,length(loc)-length(a[n])-1)
+      body=$1; for(i=3;i<=NF;i++) body=body " " $i
+      gsub(/\\/,"\\\\",body); gsub(/"/,"\\\"",body); gsub(/\\/,"\\\\",path); gsub(/"/,"\\\"",path)
+      if(!first) printf ","; first=0
+      printf "{\"path\":\"%s\",\"line\":%s,\"side\":\"RIGHT\",\"body\":\"%s\"}", path, line, body
+    }
+    END { print "]" }' <<<"$REVIEW")"
+  if [[ "$comments" == "[]" ]]; then
+    echo "no findings had parseable line numbers — posting a summary comment instead" >&2
+    printf '%s\n\n%s\n' "$HEADER" "$REVIEW" | gh pr comment "$PR" --body-file -
+    return
+  fi
+  printf '{"commit_id":"%s","event":"COMMENT","body":%s,"comments":%s}' \
+    "$head_sha" "\"$(json_escape "$HEADER")\"" "$comments" \
+    | gh api -X POST "repos/$owner_repo/pulls/$PR/reviews" --input - >/dev/null
+  echo "Posted inline review to PR #$PR" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Emit / post.
+# ---------------------------------------------------------------------------
+if [[ "$JSON" -eq 1 ]]; then
+  to_json "$REVIEW"
+elif [[ "$INLINE" -eq 1 ]]; then
+  post_inline
+elif [[ "$COMMENT" -eq 1 ]]; then
   printf '%s\n\n%s\n' "$HEADER" "$REVIEW" | gh pr comment "$PR" --body-file -
   echo "Posted review to PR #$PR" >&2
 else

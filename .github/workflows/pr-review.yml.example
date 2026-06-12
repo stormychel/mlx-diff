@@ -1,0 +1,37 @@
+# mlx-diff PR review — EXAMPLE.
+#
+# Copy this file to .github/workflows/pr-review.yml in a repo you want reviewed.
+# It is shipped as `.example` (not `.yml`) so it does NOT run in this repo.
+#
+# Requires a SELF-HOSTED Apple-Silicon macOS runner with mlx-diff installed —
+# MLX does not run on GitHub-hosted Linux runners. See docs/vm-provisioning.md.
+
+name: mlx-diff review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  pull-requests: write   # needed to post the review comment
+  contents: read
+
+jobs:
+  review:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # full history so the base branch is available
+
+      - name: Review the PR with a local MLX model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          mlx-diff --pr "${{ github.event.pull_request.number }}" \
+                   --server \
+                   --comment \
+                   --min-severity P2
+          # --server reuses an already-running `mlx-diff --serve` to avoid a
+          # cold model load on every PR. Drop it to load the model per run.
