@@ -69,6 +69,19 @@ classify() {
   else                      printf '%s\tROOMY'   "$BLUE"; fi
 }
 
+# Resolve the HuggingFace hub cache dir and report whether a model is present.
+hf_hub_dir() {
+  if   [[ -n "${HF_HUB_CACHE:-}" ]]; then printf '%s' "$HF_HUB_CACHE"
+  elif [[ -n "${HF_HOME:-}" ]];      then printf '%s/hub' "$HF_HOME"
+  else printf '%s/.cache/huggingface/hub' "$HOME"; fi
+}
+model_cached() {  # $1 repo
+  local d; d="$(hf_hub_dir)/models--${1//\//--}/snapshots"
+  [[ -d "$d" ]] || return 1
+  local s; for s in "$d"/*/; do [[ -e "$s" ]] && return 0; done
+  return 1
+}
+
 # 1. Host check — MLX is Apple-Silicon-only.
 [[ "$(uname -s)/$(uname -m)" == "Darwin/arm64" ]] || \
   die "mlx-diff requires Apple Silicon macOS — MLX is unsupported on $(uname -s)/$(uname -m)."
@@ -100,7 +113,7 @@ RAM_GIB=$(( $(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1073741824 ))
 say "Detected ${RAM_GIB} GB system RAM. Sizing coder models (fetching live sizes)…"
 printf '\n'
 
-repos=(); sizes=(); labels=(); colors=()
+repos=(); sizes=(); labels=(); colors=(); cached=()
 rec=0; rec_size=-1
 i=0
 for entry in "${CURATED[@]}"; do
@@ -108,6 +121,7 @@ for entry in "${CURATED[@]}"; do
   s="$(size_gib "$repo" "$fb")"
   IFS=$'\t' read -r color label <<<"$(classify "$s" "$RAM_GIB")"
   repos+=("$repo"); sizes+=("$s"); labels+=("$label"); colors+=("$color")
+  if model_cached "$repo"; then cached+=("1"); else cached+=("0"); fi
   # Recommend the largest model that still fits comfortably (<= top of PERFECT).
   if (( s * 100 / RAM_GIB <= 60 )) && (( s > rec_size )); then rec=$i; rec_size=$s; fi
   i=$(( i + 1 ))
@@ -117,7 +131,9 @@ done
 
 short() { printf '%s' "${1##*/}"; }
 for j in "${!repos[@]}"; do
-  mark=""; (( j == rec )) && mark=" ${BOLD}← recommended${RST}"
+  mark=""
+  (( j == rec )) && mark="${mark} ${BOLD}← recommended${RST}"
+  [[ "${cached[$j]}" == 1 ]] && mark=" ${GREEN}✓ installed${RST}${mark}"
   printf '  %s%2d%s) %s%-7s%s %3s GB  %s%-36s%s%s\n' \
     "$BOLD" "$(( j + 1 ))" "$RST" \
     "${colors[$j]}" "${labels[$j]}" "$RST" "${sizes[$j]}" \
