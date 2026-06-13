@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.3"
+VERSION="0.4.4"
 REPO_SLUG="stormychel/mlx-diff"
 DEFAULT_MODEL="mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit"
 FAST_MODEL="mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
@@ -97,8 +97,9 @@ Maintenance:
   --version             Print version and exit
   -h, --help            Show this help
 
-Before loading a local model, mlx-diff checks it fits in free RAM and refuses
-rather than swap-killing the Mac (MLXDIFF_FORCE=1 to override).
+Before a local model loads, mlx-diff checks it fits in free RAM; if not it falls
+back to a smaller cached model (or refuses if none fits). MLXDIFF_FORCE=1 loads
+the chosen model regardless. The installer keeps a tiny lifeboat model cached.
 
 Config (lowest→highest precedence): defaults < ~/.config/mlx-diff/{model,config}
 < ./.mlx-diffrc < env (MLXDIFF_*) < flags. Run log: $LOG_FILE
@@ -252,22 +253,54 @@ model_cached() {
   return 1
 }
 
-# RAM-fit guard: refuse to load a model larger than currently-free RAM — loading
-# one anyway swap-kills the Mac. Only enforceable for a cached model (we size its
-# weights); skip if uncached or in server mode. Override with MLXDIFF_FORCE=1.
+avail_ram_gib() {                  # available RAM in GiB (reclaimable pages)
+  local p; p=$(vm_stat 2>/dev/null | awk '/Pages (free|inactive|speculative|purgeable)/ {gsub(/\./,"",$NF); s+=$NF} END{print s+0}')
+  echo $(( p * 16384 / 1073741824 ))
+}
+cached_size_gib() {                # $1 = repo → cached weight size in GiB, or empty
+  local snap; snap="$(hf_hub_dir)/models--${1//\//--}/snapshots"
+  [[ -d "$snap" ]] || return 0
+  local s ok=0; for s in "$snap"/*/; do [[ -e "$s" ]] && ok=1; done
+  (( ok )) || return 0
+  echo $(( $(du -sLk "$snap" 2>/dev/null | awk '{print $1}') / 1048576 ))
+}
+cached_models() {                  # list cached model repo ids (one per line)
+  local hub d name; hub="$(hf_hub_dir)"
+  [[ -d "$hub" ]] || return 0
+  for d in "$hub"/models--*/; do
+    [[ -d "${d}snapshots" ]] || continue
+    name="$(basename "$d")"; name="${name#models--}"; name="${name//--//}"
+    printf '%s\n' "$name"
+  done
+}
+
+# RAM-fit guard: never swap-kill the Mac. If the chosen model doesn't fit in free
+# RAM, fall back to the largest *cached* model that does (works offline). Only if
+# nothing cached fits do we refuse. Skipped in --server mode. MLXDIFF_FORCE=1
+# loads the chosen model regardless.
 ram_guard() {
   [[ "${MLXDIFF_FORCE:-0}" == "1" ]] && return 0
-  local snap; snap="$(hf_hub_dir)/models--${MODEL//\//--}/snapshots"
-  [[ -d "$snap" ]] || return 0
-  local model_gib avail_gib free_pages
-  model_gib=$(( $(du -sLk "$snap" 2>/dev/null | awk '{print $1}') / 1048576 ))
-  free_pages=$(vm_stat 2>/dev/null | awk '/Pages (free|inactive|speculative|purgeable)/ {gsub(/\./,"",$NF); s+=$NF} END{print s+0}')
-  avail_gib=$(( free_pages * 16384 / 1073741824 ))
-  if (( model_gib + 3 > avail_gib )); then
-    echo "error: $MODEL_SHORT needs ~${model_gib} GB but only ~${avail_gib} GB is free." >&2
-    echo "       Close some apps, use --fast for the smaller model, or set MLXDIFF_FORCE=1 to override." >&2
-    exit 1
+  local need avail; need="$(cached_size_gib "$MODEL")"
+  [[ -n "$need" ]] || return 0                       # not cached → can't size, skip
+  avail="$(avail_ram_gib)"
+  (( need + 3 <= avail )) && return 0                # fits — go
+
+  local repo gib best="" best_gib=-1
+  while IFS= read -r repo; do
+    [[ "$repo" == "$MODEL" ]] && continue
+    gib="$(cached_size_gib "$repo")"; [[ -n "$gib" ]] || continue
+    if (( gib + 3 <= avail && gib > best_gib )); then best="$repo"; best_gib="$gib"; fi
+  done < <(cached_models)
+
+  if [[ -n "$best" ]]; then
+    echo "warning: $MODEL_SHORT needs ~${need} GB but only ~${avail} GB is free —" >&2
+    echo "         falling back to cached ${best##*/} (~${best_gib} GB). MLXDIFF_FORCE=1 to override." >&2
+    MODEL="$best"; MODEL_SHORT="${MODEL##*/}"
+    return 0
   fi
+  echo "error: $MODEL_SHORT needs ~${need} GB and no cached model fits in ~${avail} GB free." >&2
+  echo "       Close some apps, use --fast, or set MLXDIFF_FORCE=1 to load it anyway (may swap)." >&2
+  exit 1
 }
 
 # ---------------------------------------------------------------------------
@@ -336,10 +369,10 @@ generate() {                       # stdin: diff ; stdout: review ; $1 = label
 # has a 256k context) and the hardened prompt curbs repetition (#18). Only a diff
 # above CHUNK_BYTES is split per-file (#11), reviewed one fresh process per file.
 # ---------------------------------------------------------------------------
-printf '→ mlx-diff: reviewing %s · %s · %d KB\n' "$SOURCE" "$MODEL_SHORT" "$(( (DIFF_BYTES + 1023) / 1024 ))" >&2
-
-# Refuse to load a too-big model locally (server mode loads nothing here).
+# Check RAM fit first (may fall back to a smaller cached model) so the line below
+# names the model actually used. Server mode loads nothing locally.
 [[ "$USE_SERVER" -eq 0 ]] && ram_guard
+printf '→ mlx-diff: reviewing %s · %s · %d KB\n' "$SOURCE" "$MODEL_SHORT" "$(( (DIFF_BYTES + 1023) / 1024 ))" >&2
 
 if [[ "$NOCHUNK" -eq 0 && "$DIFF_BYTES" -gt "$CHUNK_BYTES" ]]; then
   CHUNK_DIR="$(mktemp -d)"

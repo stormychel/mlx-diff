@@ -176,6 +176,23 @@ else
   fi
 fi
 
+# 5b. Lifeboat: keep the smallest curated model cached as a guaranteed-fits
+#     fallback, so a low-RAM machine always has something to fall back to when
+#     the chosen model won't fit. Skip with MLXDIFF_SKIP_LIFEBOAT=1.
+LIFEBOAT="${repos[0]}"
+if [[ "${MLXDIFF_SKIP_LIFEBOAT:-0}" != "1" && "$CHOSEN" != "$LIFEBOAT" ]]; then
+  if model_cached "$LIFEBOAT"; then
+    say "Lifeboat model already cached: ${LIFEBOAT##*/}"
+  elif [[ "${MLXDIFF_SKIP_PULL:-0}" != "1" ]]; then
+    say "Pulling lifeboat model ${LIFEBOAT##*/} (~${sizes[0]} GB) — your offline fallback…"
+    if mlx_lm.generate --model "$LIFEBOAT" --prompt "ok" --max-tokens 1 --verbose False >/dev/null 2>&1; then
+      say "Lifeboat ready."
+    else
+      say "Lifeboat pull skipped/failed — fetch it later with: MLXDIFF_MODEL=$LIFEBOAT mlx-diff --base main"
+    fi
+  fi
+fi
+
 # 6. Symlink the CLI onto PATH.
 mkdir -p "$(dirname "$BIN_DEST")"
 ln -sf "$BIN_SRC" "$BIN_DEST"

@@ -141,14 +141,17 @@ Tail it (`tail -f`) or pipe it through `jq` to audit what was reviewed, when, an
 
 ## RAM-fit guard
 
-Before loading a local model, mlx-diff checks it fits in **currently-free** RAM (`vm_stat`) and refuses with a clear message rather than swap-killing the Mac:
+Before loading a local model, mlx-diff checks it fits in **currently-free** RAM (`vm_stat`) so it never swap-kills the Mac. It doesn't dead-end, though:
 
-```
-error: Qwen3-Coder-30B-A3B-Instruct-8bit needs ~30 GB but only ~9 GB is free.
-       Close some apps, use --fast for the smaller model, or set MLXDIFF_FORCE=1 to override.
-```
+1. **Fits** → run it.
+2. **Doesn't fit, but a smaller cached model does** → fall back to the largest cached model that fits (offline, no download):
+   ```
+   warning: Qwen3-Coder-30B-A3B-Instruct-8bit needs ~30 GB but only ~10 GB is free —
+            falling back to cached Qwen2.5-Coder-7B-Instruct-8bit (~8 GB). MLXDIFF_FORCE=1 to override.
+   ```
+3. **Nothing cached fits** → refuse with an actionable message.
 
-It only applies to already-cached models (so it can size them) and is skipped in `--server` mode. Override with `MLXDIFF_FORCE=1`.
+The installer keeps the smallest curated model (~3 GB) cached as a **lifeboat** so the fallback always has something to land on (`MLXDIFF_SKIP_LIFEBOAT=1` to skip). Only cached models are sized; skipped in `--server` mode; `MLXDIFF_FORCE=1` loads the chosen model regardless.
 
 ## Requirements
 
