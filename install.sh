@@ -39,11 +39,24 @@ fi
 say() { printf '%s==>%s %s\n' "$BOLD" "$RST" "$1"; }
 die() { printf '%serror:%s %s\n' "$RED" "$RST" "$1" >&2; exit 1; }
 
+# HuggingFace auth: a token (HF_TOKEN env, or a cached `hf auth login` token)
+# avoids rate limits and the "unauthenticated requests" warning on downloads.
+hf_token() {
+  if [[ -n "${HF_TOKEN:-}" ]]; then printf '%s' "$HF_TOKEN"; return; fi
+  local f="${HF_HOME:-$HOME/.cache/huggingface}/token"
+  [[ -r "$f" ]] && tr -d '[:space:]' < "$f"
+}
+hf_get() {                          # $1 = url → body (authenticated if a token exists)
+  local tok; tok="$(hf_token)"
+  if [[ -n "$tok" ]]; then curl -sS -m 20 -H "Authorization: Bearer $tok" "$1" 2>/dev/null
+  else curl -sS -m 20 "$1" 2>/dev/null; fi
+}
+
 # size_gib <repo> <fallback> — echo the .safetensors weight size in GiB (integer).
 size_gib() {
   local bytes=""
   if command -v curl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-    bytes="$(curl -sS -m 20 "https://huggingface.co/api/models/$1?blobs=true" 2>/dev/null | python3 -c '
+    bytes="$(hf_get "https://huggingface.co/api/models/$1?blobs=true" | python3 -c '
 import sys, json
 try:
     d = json.load(sys.stdin)
@@ -86,6 +99,14 @@ model_cached() {  # $1 repo
 [[ "$(uname -s)/$(uname -m)" == "Darwin/arm64" ]] || \
   die "mlx-diff requires Apple Silicon macOS — MLX is unsupported on $(uname -s)/$(uname -m)."
 say "Host OK: $(uname -s) $(uname -m)"
+
+# HuggingFace token nudge (downloads are rate-limited / warn without one).
+if [[ -n "$(hf_token)" ]]; then
+  say "HuggingFace token detected — authenticated downloads."
+else
+  say "No HuggingFace token — downloads may be slow/rate-limited."
+  say "  Optional: export HF_TOKEN=hf_…  (or run: hf auth login)  then re-run."
+fi
 
 # 2. pipx
 if ! command -v pipx >/dev/null 2>&1; then

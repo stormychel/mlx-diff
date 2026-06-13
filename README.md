@@ -96,7 +96,9 @@ mlx-diff --base main --fast
 | `MLXDIFF_SERVER_URL`   | —      | Use this OpenAI-compatible server |
 | `MLXDIFF_PROMPT_FILE`  | —      | Use a custom system prompt from this file |
 | `MLXDIFF_NO_UPDATE_CHECK` | —   | Set to `1` to disable the daily update check |
+| `MLXDIFF_FORCE`        | —      | Set to `1` to skip the RAM-fit guard |
 | `MLXDIFF_LOG`          | `$XDG_STATE_HOME/mlx-diff/runs.jsonl` | Run-trace log path |
+| `HF_TOKEN`             | —      | HuggingFace token — avoids download rate limits and the "unauthenticated requests" warning (or run `hf auth login`) |
 
 ## Configuration
 
