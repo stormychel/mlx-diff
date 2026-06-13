@@ -45,10 +45,18 @@ On install, `mlx-diff` detects your system RAM, fetches the real (`.safetensors`
 
   BAD >¾ RAM   TOUGH >½   PERFECT ≈½   ROOMY <½ (safe, smaller)
 
+  FRONTIER — open models rivaling top US models; need a 512 GB+ Mac Studio:
+   8) FRONTIER 390 GB  GLM-5-4bit
+   9) FRONTIER 597 GB  Kimi-K2.7-Code-4bit
+
 Pick a model [7]:
 ```
 
 Each fit label is color-coded in a real terminal, and `✓ installed` marks models already in your HuggingFace cache (no download needed). Press Enter to take the recommendation, or type a number.
+
+### Frontier tier
+
+Below the curated list, the picker also surfaces a **frontier tier** — state-of-the-art *open* models that rival the top proprietary US models: **GLM-5** (`mlx-community/GLM-5-4bit`) and **Kimi K2.7** (`mlx-community/Kimi-K2.7-Code-4bit`). These are 400–600 GB even at 4-bit, so they only run on a **512 GB+ Mac Studio** — they're listed (and selectable by number, behind a confirmation) but **never recommended**, and the [RAM-fit guard](#ram-fit-guard) will refuse them on anything smaller. On a normal Mac they're there for awareness, not use.
 
 | Fit | Size vs RAM | Meaning |
 |-----|-------------|---------|
