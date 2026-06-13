@@ -139,6 +139,17 @@ Every review appends one JSON line to `~/.local/state/mlx-diff/runs.jsonl`:
 
 Tail it (`tail -f`) or pipe it through `jq` to audit what was reviewed, when, and with which model.
 
+## RAM-fit guard
+
+Before loading a local model, mlx-diff checks it fits in **currently-free** RAM (`vm_stat`) and refuses with a clear message rather than swap-killing the Mac:
+
+```
+error: Qwen3-Coder-30B-A3B-Instruct-8bit needs ~30 GB but only ~9 GB is free.
+       Close some apps, use --fast for the smaller model, or set MLXDIFF_FORCE=1 to override.
+```
+
+It only applies to already-cached models (so it can size them) and is skipped in `--server` mode. Override with `MLXDIFF_FORCE=1`.
+
 ## Requirements
 
 - Apple-Silicon macOS (bare metal or VM) — runs under the system `bash` 3.2
