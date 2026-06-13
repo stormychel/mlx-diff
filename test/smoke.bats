@@ -14,7 +14,7 @@ BIN="${BATS_TEST_DIRNAME}/../bin/mlx-diff"
 @test "--version prints the version" {
   run "$BIN" --version
   [ "$status" -eq 0 ]
-  [[ "$output" == *"mlx-diff 0.4.5"* ]]
+  [[ "$output" == *"mlx-diff 0.4.6"* ]]
 }
 
 @test "unknown option fails with a message" {
