@@ -1,5 +1,15 @@
 # mlx-diff
 
+```
+              __               ___ ________
+   ____ ___  / /  __      ____/ (_) __/ __/
+  / __ `__ \/ / |/_/_____/ __  / / /_/ /_
+ / / / / / / />  </_____/ /_/ / / __/ __/
+/_/ /_/ /_/_/_/|_|      \__,_/_/_/ /_/
+
+        local code review, no cloud required
+```
+
 A zero-dependency CLI that reviews a **git diff** (or a **GitHub PR**) with a **local [MLX](https://github.com/ml-explore/mlx) model** on Apple Silicon — defaulting to `Qwen3-Coder-30B-A3B-Instruct-8bit`. Fully offline, quota-free, and private: nothing leaves the machine.
 
 It slots in as the **`mlx`** rung of a `codex / claude / mlx` review choice — the fast, free, local-first pass.
